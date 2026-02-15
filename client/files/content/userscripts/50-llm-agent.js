@@ -11,10 +11,10 @@
     // Configuration defaults
     // ========================
     var llmDefaultConfig = {
-        apiEndpoint: 'http://localhost:11434/api/chat',
-        apiType: 'ollama',    // 'ollama', 'openai', 'anthropic'
+        apiEndpoint: 'http://localhost:1234/v1/chat/completions',
+        apiType: 'lmstudio',  // 'lmstudio', 'ollama', 'openai_compat', 'openai', 'anthropic'
         apiKey: '',
-        model: 'llama3',
+        model: '',
         maxTokens: 2048,
         systemPrompt: 'You are a game assistant for The Settlers Online. You help the player manage their settlement by analyzing game state and providing strategic advice.\n\nYou can execute game commands by including JSON code blocks in your responses:\n```json\n{"command": "getResources"}\n```\n```json\n{"command": "getBuildings"}\n```\n```json\n{"command": "getSpecialists"}\n```\n```json\n{"command": "getBuffs"}\n```\n```json\n{"command": "getSummary"}\n```\n```json\n{"command": "scrollToBuilding", "args": {"name": "PartialBuildingName"}}\n```\n```json\n{"command": "chatMessage", "args": {"message": "Hello!"}}\n```\n```json\n{"command": "showAlert", "args": {"message": "Notice!"}}\n```\n\nAvailable commands: getResources, getBuildings, getSpecialists, getBuffs, getSummary, scrollToBuilding, chatMessage, showAlert.\n\nWhen the user asks about their game state, use the appropriate command to fetch data. Always analyze the game state provided with the user message before suggesting actions. Be concise and strategic in your advice.',
         enabled: false
@@ -197,24 +197,47 @@
 
             this.conversationHistory.push({ role: 'user', content: userMessage });
 
+            var allMessages = [
+                { role: 'system', content: this.config.systemPrompt }
+            ].concat(this.conversationHistory);
+
             switch(this.config.apiType) {
+                case 'lmstudio':
+                    // LM Studio uses OpenAI-compatible API, no API key needed
+                    var lmBody = {
+                        messages: allMessages,
+                        stream: false
+                    };
+                    if (this.config.model) lmBody.model = this.config.model;
+                    if (this.config.maxTokens) lmBody.max_tokens = this.config.maxTokens;
+                    requestBody = JSON.stringify(lmBody);
+                    break;
+
                 case 'ollama':
                     requestBody = JSON.stringify({
                         model: this.config.model,
-                        messages: [
-                            { role: 'system', content: this.config.systemPrompt }
-                        ].concat(this.conversationHistory),
+                        messages: allMessages,
                         stream: false
                     });
+                    break;
+
+                case 'openai_compat':
+                    // Generic OpenAI-compatible server (vLLM, text-generation-webui, etc.)
+                    if (this.config.apiKey) headers['Authorization'] = 'Bearer ' + this.config.apiKey;
+                    var compatBody = {
+                        messages: allMessages,
+                        stream: false
+                    };
+                    if (this.config.model) compatBody.model = this.config.model;
+                    if (this.config.maxTokens) compatBody.max_tokens = this.config.maxTokens;
+                    requestBody = JSON.stringify(compatBody);
                     break;
 
                 case 'openai':
                     headers['Authorization'] = 'Bearer ' + this.config.apiKey;
                     requestBody = JSON.stringify({
                         model: this.config.model,
-                        messages: [
-                            { role: 'system', content: this.config.systemPrompt }
-                        ].concat(this.conversationHistory),
+                        messages: allMessages,
                         max_tokens: this.config.maxTokens
                     });
                     break;
@@ -266,7 +289,10 @@
             switch(this.config.apiType) {
                 case 'ollama':
                     return data.message ? data.message.content : (data.response || JSON.stringify(data));
+                case 'lmstudio':
+                case 'openai_compat':
                 case 'openai':
+                    // All OpenAI-compatible APIs use the same response format
                     try { return data.choices[0].message.content; }
                     catch(e) { return JSON.stringify(data); }
                 case 'anthropic':
@@ -449,24 +475,28 @@
         var config = $.extend({}, llmDefaultConfig, settings.read(null, 'llm') || {});
 
         var apiTypeSelect = '<select id="llmApiType" class="form-control">' +
+            '<option value="lmstudio">LM Studio (Local)</option>' +
             '<option value="ollama">Ollama (Local)</option>' +
-            '<option value="openai">OpenAI</option>' +
-            '<option value="anthropic">Anthropic (Claude)</option>' +
+            '<option value="openai_compat">OpenAI Compatible (Local/Custom)</option>' +
+            '<option value="openai">OpenAI (Cloud)</option>' +
+            '<option value="anthropic">Anthropic Claude (Cloud)</option>' +
             '</select>';
 
         var html = '<div class="container-fluid">';
         html += createTableRow([[4, 'API Type'], [8, apiTypeSelect]]);
         html += createTableRow([[4, 'Endpoint URL'], [8, '<input type="text" id="llmEndpoint" class="form-control" value="' + escapeHtml(config.apiEndpoint) + '">']]);
-        html += createTableRow([[4, 'API Key'], [8, '<input type="password" id="llmApiKey" class="form-control" placeholder="Not needed for Ollama" value="' + escapeHtml(config.apiKey) + '">']]);
-        html += createTableRow([[4, 'Model'], [8, '<input type="text" id="llmModel" class="form-control" value="' + escapeHtml(config.model) + '">']]);
+        html += createTableRow([[4, 'API Key'], [8, '<input type="password" id="llmApiKey" class="form-control" placeholder="Not needed for local servers (LM Studio, Ollama)" value="' + escapeHtml(config.apiKey) + '">']]);
+        html += createTableRow([[4, 'Model'], [8, '<input type="text" id="llmModel" class="form-control" placeholder="Leave empty for LM Studio (uses loaded model)" value="' + escapeHtml(config.model) + '">']]);
         html += createTableRow([[4, 'Max Tokens'], [8, '<input type="number" id="llmMaxTokens" class="form-control" value="' + config.maxTokens + '">']]);
         html += createTableRow([[4, 'System Prompt'], [8, '<textarea id="llmSystemPrompt" class="form-control" rows="6">' + escapeHtml(config.systemPrompt) + '</textarea>']]);
         html += createTableRow([[4, 'Enabled'], [8, createSwitch('llmEnabled', config.enabled)]]);
         html += '<div style="margin-top:10px;padding:8px;background:#2a2a3e;border-radius:4px;font-size:11px;color:#aaa;">';
         html += '<b>Presets:</b> ';
+        html += '<a href="#" class="llmPreset" data-type="lmstudio" data-url="http://localhost:1234/v1/chat/completions" data-model="" style="color:#4fc3f7;">LM Studio</a> | ';
         html += '<a href="#" class="llmPreset" data-type="ollama" data-url="http://localhost:11434/api/chat" data-model="llama3" style="color:#4fc3f7;">Ollama</a> | ';
-        html += '<a href="#" class="llmPreset" data-type="openai" data-url="https://api.openai.com/v1/chat/completions" data-model="gpt-4o" style="color:#4fc3f7;">OpenAI GPT-4o</a> | ';
-        html += '<a href="#" class="llmPreset" data-type="anthropic" data-url="https://api.anthropic.com/v1/messages" data-model="claude-sonnet-4-20250514" style="color:#4fc3f7;">Anthropic Claude</a>';
+        html += '<a href="#" class="llmPreset" data-type="openai_compat" data-url="http://localhost:8080/v1/chat/completions" data-model="" style="color:#4fc3f7;">OpenAI Compat</a> | ';
+        html += '<a href="#" class="llmPreset" data-type="openai" data-url="https://api.openai.com/v1/chat/completions" data-model="gpt-4o" style="color:#4fc3f7;">OpenAI</a> | ';
+        html += '<a href="#" class="llmPreset" data-type="anthropic" data-url="https://api.anthropic.com/v1/messages" data-model="claude-sonnet-4-20250514" style="color:#4fc3f7;">Anthropic</a>';
         html += '</div>';
         html += '</div>';
 
@@ -485,12 +515,16 @@
         w.withsBody('#llmApiType').change(function() {
             var type = $(this).val();
             var endpoints = {
+                'lmstudio': 'http://localhost:1234/v1/chat/completions',
                 'ollama': 'http://localhost:11434/api/chat',
+                'openai_compat': 'http://localhost:8080/v1/chat/completions',
                 'openai': 'https://api.openai.com/v1/chat/completions',
                 'anthropic': 'https://api.anthropic.com/v1/messages'
             };
             var models = {
+                'lmstudio': '',
                 'ollama': 'llama3',
+                'openai_compat': '',
                 'openai': 'gpt-4o',
                 'anthropic': 'claude-sonnet-4-20250514'
             };
