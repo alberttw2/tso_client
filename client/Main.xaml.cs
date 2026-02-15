@@ -28,7 +28,7 @@ namespace client
         static byte[] additionalEntropy = { 2, 1, 8, 4, 2 };
         private clientSettings _settings = new clientSettings();
         public static bool debug = false;
-        public static string setting_file = "settings.dat";
+        public static string setting_file = "settings.json";
         public static string tso_folder = "tso_portable";
         public static string lang = string.Empty;
         public static int http_timeout = 300000;
@@ -86,13 +86,17 @@ namespace client
             "--fastlogin - use saved token and client boot arg. Read wiki carefully before use it!",
             "--token - extra token for fastlogin",
             "--password - set password",
-            "--autologin - allows to start client with login/password from setting.dat",
+            "--autologin - allows to start client with login/password from settings file",
             "--lang [de|us|en|fr|ru|pl|es2|es|nl|cz|pt|it|el|ro|cn] - changes the game interface language.",
             "--window [fullscreen|maximized|minimized] - initital game window size",
             "--skip - allows to skip update checking of client.swf",
             "--tsofolder - set different tso folder name",
             "--x64 - use x64 adobe air runtime",
-            "--debug - creates a debug.txt file with an error report in case of failure"
+            "--debug - creates a debug.txt file with an error report in case of failure",
+            "",
+            "Portable mode: place a settings.json file next to the launcher executable.",
+            "Each copy of the client folder will use its own independent configuration.",
+            "Settings are stored as plain JSON for portability between machines."
         };
 
         protected void OnPropertyChanged(string propertyName)
@@ -110,12 +114,37 @@ namespace client
             Loaded += Main_Loaded;
         }
 
+        private bool _portableMode = false;
+
         private void Main_Loaded(object sender, RoutedEventArgs e)
         {
             WinVersion.GetVersion(out winver);
             if (cmd["config"] != null)
+            {
                 setting_file = cmd["config"].Trim();
+            }
+            else
+            {
+                // Auto-detect portable mode: if settings.json or settings.dat exists
+                // next to the executable, use it (each copy of the client is independent)
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string localJson = Path.Combine(baseDir, "settings.json");
+                string localDat = Path.Combine(baseDir, "settings.dat");
+                if (File.Exists(localJson))
+                {
+                    setting_file = localJson;
+                    _portableMode = true;
+                }
+                else if (File.Exists(localDat))
+                {
+                    setting_file = localDat;
+                    _portableMode = true;
+                }
+            }
             ReadSettings();
+            // In portable mode, force game folder to be next to the launcher
+            if (_portableMode)
+                _settings.tsoFolderNearLauncher = true;
             if (cmd["debug"] != null)
                 debug = true;
             if (cmd["tsofolder"] != null)
@@ -166,27 +195,50 @@ namespace client
             Dispatcher.BeginInvoke(new ThreadStart(delegate { butt.IsEnabled = false; error.Text = Servers.getTrans("checking"); }));
             if (!Directory.Exists(ClientDirectory))
                 Directory.CreateDirectory(ClientDirectory);
-            
-            using (var unzip = new Unzip(new MemoryStream(Properties.Resources.content)))
+
+            // Use a lock file to prevent multiple instances from extracting simultaneously
+            string lockFile = Path.Combine(ClientDirectory, ".tso_update.lock");
+            FileStream lockStream = null;
+            try
             {
-                // ensure that scripts dir always fresh
-                if(Directory.Exists(Path.Combine(ClientDirectory, "scripts")))
+                lockStream = new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+                using (var unzip = new Unzip(new MemoryStream(Properties.Resources.content)))
                 {
-                    DirectoryInfo dir = new DirectoryInfo(Path.Combine(ClientDirectory, "scripts"));
-                    foreach (FileInfo fi in dir.GetFiles())
+                    // ensure that scripts dir always fresh
+                    if(Directory.Exists(Path.Combine(ClientDirectory, "scripts")))
                     {
-                        if (!debug)
-                            fi.Delete();
+                        DirectoryInfo dir = new DirectoryInfo(Path.Combine(ClientDirectory, "scripts"));
+                        foreach (FileInfo fi in dir.GetFiles())
+                        {
+                            if (!debug)
+                                fi.Delete();
+                        }
                     }
+                    if (!debug)
+                        unzip.ExtractToDirectory(ClientDirectory);
                 }
-                if (!debug)
-                    unzip.ExtractToDirectory(ClientDirectory);
+            }
+            catch (IOException)
+            {
+                // Another instance is extracting to the same directory, skip
+                Thread.Sleep(3000);
+            }
+            finally
+            {
+                if (lockStream != null)
+                {
+                    lockStream.Close();
+                    try { File.Delete(lockFile); } catch { }
+                }
             }
             try
             {
                 foreach (string tmpDir in Directory.GetDirectories(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TSO-*"))
                 {
-                    Directory.Delete(tmpDir, true);
+                    try { Directory.Delete(tmpDir, true); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
                 }
             }
             catch { }
@@ -351,41 +403,85 @@ namespace client
             return resultArray.ToArray();
         }
 
+        private void SaveSettingsToFile()
+        {
+            File.WriteAllText(setting_file, new JavaScriptSerializer().Serialize(_settings));
+        }
+
         public void ReadSettings()
         {
             string settings = null;
+            bool loaded = false;
+
+            // Try the configured settings file (settings.json by default)
             if (File.Exists(setting_file))
             {
                 try
                 {
-                    settings = Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(setting_file), additionalEntropy, DataProtectionScope.LocalMachine));
+                    settings = File.ReadAllText(setting_file);
                     _settings = new JavaScriptSerializer().Deserialize<clientSettings>(settings);
+                    loaded = true;
                 }
                 catch
                 {
+                    // File exists but is not valid JSON - try DPAPI (old encrypted format)
                     try
                     {
-                        //convert
-                        string[] settings_convert = settings.Split(new[] { '|' }, StringSplitOptions.None);
-                        _settings = new clientSettings()
-                        {
-                            username = settings_convert[0].Trim(),
-                            password = settings_convert[1].Trim(),
-                            nickName = settings_convert[3].Trim(),
-                            region = int.Parse(settings_convert[5].Trim())
-                        };
-                        if(!string.IsNullOrEmpty(_settings.nickName) && _settings.nickName != "0")
-                        {
-                            _settings.tsoArg = UTF8Encoding.UTF8.GetString(Convert.FromBase64String(settings_convert[4].Trim()));
-                        }
-                        Dispatcher.BeginInvoke(new ThreadStart(delegate { error.Text = "Settings converted"; }));
+                        byte[] data = File.ReadAllBytes(setting_file);
+                        settings = Encoding.UTF8.GetString(ProtectedData.Unprotect(data, additionalEntropy, DataProtectionScope.LocalMachine));
+                        _settings = new JavaScriptSerializer().Deserialize<clientSettings>(settings);
+                        loaded = true;
+                        // Auto-migrate to plain JSON
+                        SaveSettingsToFile();
                     }
                     catch
                     {
-                        File.Move(setting_file, string.Format("bad_{0}", setting_file));
+                        try
+                        {
+                            //convert legacy pipe-delimited format
+                            string[] settings_convert = settings.Split(new[] { '|' }, StringSplitOptions.None);
+                            _settings = new clientSettings()
+                            {
+                                username = settings_convert[0].Trim(),
+                                password = settings_convert[1].Trim(),
+                                nickName = settings_convert[3].Trim(),
+                                region = int.Parse(settings_convert[5].Trim())
+                            };
+                            if(!string.IsNullOrEmpty(_settings.nickName) && _settings.nickName != "0")
+                            {
+                                _settings.tsoArg = UTF8Encoding.UTF8.GetString(Convert.FromBase64String(settings_convert[4].Trim()));
+                            }
+                            loaded = true;
+                            Dispatcher.BeginInvoke(new ThreadStart(delegate { error.Text = "Settings converted"; }));
+                        }
+                        catch
+                        {
+                            File.Move(setting_file, string.Format("bad_{0}", setting_file));
+                        }
                     }
                 }
             }
+
+            // If settings.json not found, check for legacy settings.dat
+            if (!loaded && setting_file.EndsWith(".json"))
+            {
+                string legacyFile = setting_file.Replace(".json", ".dat");
+                if (File.Exists(legacyFile))
+                {
+                    try
+                    {
+                        byte[] data = File.ReadAllBytes(legacyFile);
+                        settings = Encoding.UTF8.GetString(ProtectedData.Unprotect(data, additionalEntropy, DataProtectionScope.LocalMachine));
+                        _settings = new JavaScriptSerializer().Deserialize<clientSettings>(settings);
+                        loaded = true;
+                        // Migrate: save as plain JSON
+                        SaveSettingsToFile();
+                        Dispatcher.BeginInvoke(new ThreadStart(delegate { error.Text = "Settings migrated to JSON"; }));
+                    }
+                    catch { }
+                }
+            }
+
             if (!string.IsNullOrEmpty(_settings.username))
             {
                 login.Text = _settings.username;
@@ -534,7 +630,7 @@ namespace client
                 _settings.username = string.Empty;
                 _settings.password = string.Empty;
             }
-            File.WriteAllBytes(setting_file, ProtectedData.Protect(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(_settings)), additionalEntropy, DataProtectionScope.LocalMachine));
+            SaveSettingsToFile();
             login log = new login() { Owner = ((null == e) ? null : this), _settings = _settings, username = login.Text, password = password.Password, totpKey = totpkey, region = _region, WindowStartupLocation = ((null == e) ? System.Windows.WindowStartupLocation.CenterScreen : System.Windows.WindowStartupLocation.CenterOwner) };
             log.ShowDialog();
             if (log.DialogResult == true)
@@ -553,7 +649,7 @@ namespace client
                 {
                     dropboxUploadFile(_settings.accountId + ".dat", new Crypt().Encrypt(_settings.tsoArg, true));
                 } catch { }
-                File.WriteAllBytes(setting_file, ProtectedData.Protect(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(_settings)), additionalEntropy, DataProtectionScope.LocalMachine));
+                SaveSettingsToFile();
                 run_tso(false);
             }
             this.Visibility = System.Windows.Visibility.Visible;
@@ -690,7 +786,7 @@ namespace client
                 totpkey = _settings.totpkey;
                 if (isLoaded)
                     new Thread(checkVersion) { IsBackground = true }.Start();
-                File.WriteAllBytes(setting_file, ProtectedData.Protect(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(_settings)), additionalEntropy, DataProtectionScope.LocalMachine));
+                SaveSettingsToFile();
                 ReadSettings();
             }
         }
