@@ -16,7 +16,7 @@
         apiKey: '',
         model: '',
         maxTokens: 2048,
-        systemPrompt: 'You are a game assistant for The Settlers Online. You help the player manage their settlement by analyzing game state and providing strategic advice.\n\nYou can execute game commands by including JSON code blocks in your responses:\n```json\n{"command": "getResources"}\n```\n```json\n{"command": "getBuildings"}\n```\n```json\n{"command": "getSpecialists"}\n```\n```json\n{"command": "getBuffs"}\n```\n```json\n{"command": "getSummary"}\n```\n```json\n{"command": "scrollToBuilding", "args": {"name": "PartialBuildingName"}}\n```\n```json\n{"command": "chatMessage", "args": {"message": "Hello!"}}\n```\n```json\n{"command": "showAlert", "args": {"message": "Notice!"}}\n```\n\nAvailable commands: getResources, getBuildings, getSpecialists, getBuffs, getSummary, scrollToBuilding, chatMessage, showAlert.\n\nWhen the user asks about their game state, use the appropriate command to fetch data. Always analyze the game state provided with the user message before suggesting actions. Be concise and strategic in your advice.',
+        systemPrompt: 'You are a game assistant for The Settlers Online. You help the player manage their settlement by analyzing game state, providing strategic advice, and executing automation commands.\n\nYou can execute game commands by including JSON code blocks in your responses:\n\n**Information commands:**\n```json\n{"command": "getResources"}\n```\n```json\n{"command": "getBuildings"}\n```\n```json\n{"command": "getSpecialists"}\n```\n```json\n{"command": "getBuffs"}\n```\n```json\n{"command": "getSummary"}\n```\n```json\n{"command": "getDepletedMines"}\n```\n```json\n{"command": "findBuildings", "args": {"pattern": "PartialName"}}\n```\n```json\n{"command": "analyzeProduction"}\n```\n\n**Action commands:**\n```json\n{"command": "scrollToBuilding", "args": {"name": "PartialBuildingName"}}\n```\n```json\n{"command": "toggleProduction", "args": {"grid": 12345, "enable": true}}\n```\n```json\n{"command": "massToggleProduction", "args": {"pattern": "Lumberjack", "enable": false}}\n```\n```json\n{"command": "demolishBuilding", "args": {"grid": 12345}}\n```\n```json\n{"command": "demolishAllDepleted"}\n```\n```json\n{"command": "refreshZone"}\n```\n```json\n{"command": "chatMessage", "args": {"message": "Hello!"}}\n```\n```json\n{"command": "showAlert", "args": {"message": "Notice!"}}\n```\n\nWhen the user asks about their game state, use the appropriate command to fetch data. For automation tasks (like demolishing depleted mines), first use getDepletedMines to check what needs to be done, then execute the action. Always analyze the game state provided with the user message before suggesting actions. Be concise and strategic in your advice.',
         enabled: false
     };
 
@@ -107,10 +107,10 @@
                 playerLevel: (function() { try { return swmmo.application.mGameInterface.mHomePlayer.GetPlayerLevel(); } catch(e) { return 'unknown'; } })(),
                 buildingCount: buildingCount,
                 specialistCount: specCount,
+                depletedMines: (function() { try { return LLMGameState.getDepletedMines().length; } catch(e) { return 0; } })(),
                 topResources: (function() {
                     var res = LLMGameState.getResources();
                     if (res.error) return res;
-                    // Return top 20 resources by amount
                     var sorted = [];
                     for (var k in res) { sorted.push({ name: k, amount: res[k] }); }
                     sorted.sort(function(a, b) { return b.amount - a.amount; });
@@ -121,6 +121,96 @@
                     return top;
                 })()
             };
+        },
+
+        // Get all depleted mines
+        getDepletedMines: function() {
+            try {
+                var result = [];
+                var validRes = ['Stone','Marble','GoldOre','BronzeOre','IronOre','TitaniumOre','Coal','Salpeter','Granite'];
+                game.gi.mCurrentPlayerZone.mStreetDataMap.GetBuildings_vector().forEach(function(bui) {
+                    if (bui != null && bui.GetBuildingName_string().indexOf("MineDepleted") >= 0) {
+                        var name = bui.GetBuildingName_string();
+                        var resource = name.replace("MineDepletedDeposit", '');
+                        result.push({
+                            name: name,
+                            resource: resource,
+                            grid: bui.GetGrid(),
+                            valid: validRes.indexOf(resource) >= 0
+                        });
+                    }
+                });
+                return result;
+            } catch(e) { return { error: e.toString() }; }
+        },
+
+        // Get detailed info about buildings matching a name pattern
+        findBuildings: function(pattern) {
+            try {
+                var buildings = game.getBuildings();
+                if (!buildings) return [];
+                var result = [];
+                var pat = (pattern || '').toLowerCase();
+                for (var i = 0; i < buildings.length; i++) {
+                    try {
+                        var name = buildings[i].getName();
+                        var fullName = buildings[i].GetBuildingName_string();
+                        if (pat && name.toLowerCase().indexOf(pat) < 0 && fullName.toLowerCase().indexOf(pat) < 0) continue;
+                        var info = {
+                            name: name,
+                            fullName: fullName,
+                            grid: buildings[i].GetGrid(),
+                            productionActive: false,
+                            upgradeLevel: 0,
+                            upgrading: false
+                        };
+                        try { info.productionActive = buildings[i].IsProductionActive(); } catch(e) {}
+                        try { info.upgradeLevel = buildings[i].GetUpgradeLevel(); } catch(e) {}
+                        try { info.upgrading = buildings[i].IsUpgradeInProgress(); } catch(e) {}
+                        try {
+                            var rc = buildings[i].GetResourceCreation();
+                            if (rc) info.productionState = rc.GetProductionState();
+                        } catch(e) {}
+                        result.push(info);
+                    } catch(e) {}
+                }
+                return result;
+            } catch(e) { return { error: e.toString() }; }
+        },
+
+        // Analyze production - find idle/stopped buildings
+        analyzeProduction: function() {
+            try {
+                var buildings = game.getBuildings();
+                if (!buildings) return { error: 'No buildings' };
+                var active = [], stopped = [], idle = [];
+                for (var i = 0; i < buildings.length; i++) {
+                    try {
+                        var name = buildings[i].getName();
+                        var grid = buildings[i].GetGrid();
+                        var isActive = buildings[i].IsProductionActive();
+                        var state = -1;
+                        try {
+                            var rc = buildings[i].GetResourceCreation();
+                            if (rc) state = rc.GetProductionState();
+                        } catch(e) {}
+                        if (isActive && state === 0) {
+                            idle.push({ name: name, grid: grid, reason: 'productionState=0 (possibly missing resources)' });
+                        } else if (isActive) {
+                            active.push({ name: name, grid: grid });
+                        } else {
+                            stopped.push({ name: name, grid: grid });
+                        }
+                    } catch(e) {}
+                }
+                return {
+                    activeCount: active.length,
+                    stoppedCount: stopped.length,
+                    idleCount: idle.length,
+                    stopped: stopped.slice(0, 30),
+                    idle: idle.slice(0, 30)
+                };
+            } catch(e) { return { error: e.toString() }; }
         }
     };
 
@@ -154,6 +244,85 @@
             'showAlert': function(args) {
                 game.showAlert(args.message || '');
                 return { success: true };
+            },
+            'getDepletedMines': function() {
+                return LLMGameState.getDepletedMines();
+            },
+            'findBuildings': function(args) {
+                return LLMGameState.findBuildings(args.pattern || '');
+            },
+            'analyzeProduction': function() {
+                return LLMGameState.analyzeProduction();
+            },
+            'toggleProduction': function(args) {
+                // Toggle production on/off for a building at the given grid position
+                // args.grid: grid position of the building
+                // args.enable: true to start, false to stop
+                try {
+                    var grid = parseInt(args.grid);
+                    var enable = args.enable ? 1 : 0;
+                    game.gi.SendServerAction(107, enable, grid, 0, null);
+                    return { success: true, grid: grid, enabled: !!args.enable };
+                } catch(e) { return { success: false, error: e.toString() }; }
+            },
+            'demolishBuilding': function(args) {
+                // Demolish a building at the given grid position
+                // args.grid: grid position of the building
+                try {
+                    var grid = parseInt(args.grid);
+                    var bui = game.zone.mStreetDataMap.GetBuildingByGridPos(grid);
+                    if (!bui) return { success: false, error: 'No building at grid ' + grid };
+                    var name = bui.GetBuildingName_string();
+                    game.gi.SendServerAction(108, 0, grid, 0, null);
+                    return { success: true, grid: grid, demolished: name };
+                } catch(e) { return { success: false, error: e.toString() }; }
+            },
+            'demolishAllDepleted': function() {
+                // Find and demolish all depleted mines
+                try {
+                    var depleted = LLMGameState.getDepletedMines();
+                    if (depleted.error) return depleted;
+                    if (depleted.length === 0) return { success: true, message: 'No depleted mines found', count: 0 };
+                    var queue = new TimedQueue(1500);
+                    var names = [];
+                    depleted.forEach(function(mine) {
+                        names.push(mine.resource + ' (grid:' + mine.grid + ')');
+                        queue.add(function() {
+                            game.gi.SendServerAction(108, 0, mine.grid, 0, null);
+                        });
+                    });
+                    queue.run();
+                    return { success: true, count: depleted.length, demolished: names };
+                } catch(e) { return { success: false, error: e.toString() }; }
+            },
+            'massToggleProduction': function(args) {
+                // Toggle production for all buildings matching a name pattern
+                // args.pattern: building name pattern to match
+                // args.enable: true to start, false to stop
+                try {
+                    var buildings = LLMGameState.findBuildings(args.pattern || '');
+                    if (buildings.error) return buildings;
+                    var enable = args.enable ? 1 : 0;
+                    var toggled = [];
+                    var queue = new TimedQueue(1000);
+                    buildings.forEach(function(bui) {
+                        if (bui.productionActive !== !!args.enable) {
+                            toggled.push(bui.name + ' (grid:' + bui.grid + ')');
+                            queue.add(function() {
+                                game.gi.SendServerAction(107, enable, bui.grid, 0, null);
+                            });
+                        }
+                    });
+                    if (toggled.length > 0) queue.run();
+                    return { success: true, count: toggled.length, toggled: toggled.slice(0, 20) };
+                } catch(e) { return { success: false, error: e.toString() }; }
+            },
+            'refreshZone': function() {
+                // Refresh the current zone data from the server
+                try {
+                    game.gi.mClientMessages.SendMessagetoServer(1037, game.gi.mCurrentViewedZoneID, null);
+                    return { success: true, message: 'Zone refresh requested' };
+                } catch(e) { return { success: false, error: e.toString() }; }
             }
         },
 
@@ -339,6 +508,8 @@
             html += '<button class="btn btn-xs btn-default llmQuick" data-q="What resources am I low on? What should I prioritize producing?">Resources</button> ';
             html += '<button class="btn btn-xs btn-default llmQuick" data-q="List my specialists and suggest what tasks to assign them">Specialists</button> ';
             html += '<button class="btn btn-xs btn-default llmQuick" data-q="Analyze my buildings and suggest what to build or upgrade next">Buildings</button> ';
+            html += '<button class="btn btn-xs btn-warning llmQuick" data-q="Check for depleted mines and demolish them all">Demolish Depleted</button> ';
+            html += '<button class="btn btn-xs btn-default llmQuick" data-q="Analyze my production: which buildings are stopped or idle?">Production</button> ';
             html += '</div>';
             html += '</div>';
 
